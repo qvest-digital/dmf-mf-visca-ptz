@@ -1,7 +1,8 @@
+import os
 import socket
 import serial
 import time
-from flask import Flask, render_template
+from flask import Flask, jsonify, render_template, request
 from flask_socketio import SocketIO, emit
 
 app = Flask(__name__)
@@ -13,6 +14,9 @@ class ViscaController:
         self.connection_type = None 
         self.ser = None
         self.sock = None
+        self.peer = None
+        self.seq = 0
+        self.target = None
         self.address = 1 
         self.pan_speed = 0x0C 
         self.tilt_speed = 0x0A 
@@ -29,8 +33,17 @@ class ViscaController:
                 self.ser.write(packet)
             elif self.connection_type == 'tcp' and self.sock:
                 self.sock.send(packet)
+            elif self.connection_type == 'sony_udp' and self.sock:
+                # Sony VISCA over IP: payload type 0x0100 (VISCA command),
+                # payload length and a sequence number ahead of the VISCA bytes.
+                self.seq = (self.seq + 1) & 0xFFFFFFFF
+                header = b'\x01\x00' + len(packet).to_bytes(2, 'big') + self.seq.to_bytes(4, 'big')
+                self.sock.sendto(header + packet, self.peer)
         except Exception as e:
             print(f"TX Raw Error: {e}")
+            if self.connection_type == 'tcp':
+                # A broken TCP link is reopened by the next ensure_connected().
+                self.connection_type = None
 
     def send_visca(self, payload):
         header = bytes([0x80 + self.address])
@@ -54,18 +67,41 @@ class ViscaController:
             if self.sock: self.sock.close()
             self.ser = serial.Serial(port, baudrate, timeout=0.1)
             self.connection_type = 'serial'
+            self.target = {'mode': 'serial', 'port': port, 'baud': int(baudrate)}
             self.init_camera()
             return True, f"Connected Serial: {port} @ {baudrate}"
         except Exception as e:
             return False, str(e)
 
+    def connect_sony_udp(self, ip, port=52381, local_port=52381):
+        try:
+            if self.ser: self.ser.close()
+            if self.sock: self.sock.close()
+            self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            # The camera answers on UDP 52381 whatever the sender's source
+            # port, so replies only arrive on a socket bound there.
+            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.sock.bind(('0.0.0.0', int(local_port)))
+            self.peer = (ip, int(port))
+            self.seq = 0
+            # Control command RESET: the camera expects sequence numbers from 1 again.
+            self.sock.sendto(b'\x02\x00\x00\x01\x00\x00\x00\x00\x01', self.peer)
+            self.connection_type = 'sony_udp'
+            self.target = {'mode': 'sony_udp', 'ip': ip, 'port': int(port)}
+            return True, f"Connected Sony VISCA over IP: {ip}:{port}"
+        except Exception as e:
+            self.connection_type = None
+            return False, str(e)
+
     def connect_tcp(self, ip, port=5678):
         try:
             if self.ser: self.ser.close()
+            if self.sock: self.sock.close()
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.sock.settimeout(0.5)
             self.sock.connect((ip, int(port)))
             self.connection_type = 'tcp'
+            self.target = {'mode': 'tcp', 'ip': ip, 'port': int(port)}
             self.init_camera()
             return True, f"Connected TCP: {ip}:{port}"
         except Exception as e:
@@ -179,20 +215,57 @@ class ViscaController:
 
 ptz = ViscaController()
 
-@app.route('/')
-def index():
-    return render_template('index.html')
+# A deployment binds the controller to one camera through the environment.
+# With VISCA_HOST set the target is fixed: the UI and the API connect to it
+# and cannot point the controller anywhere else.
+PROTOCOLS = {'sony-udp': 'sony_udp', 'tcp': 'tcp'}
+DEFAULT_PORTS = {'sony_udp': 52381, 'tcp': 5678}
 
-@socketio.on('connect_camera')
-def handle_connect(data):
-    if data['mode'] == 'tcp':
-        success, msg = ptz.connect_tcp(data['ip'], data['port'])
-    else:
-        success, msg = ptz.connect_serial(data['port'], int(data['baud']))
-    emit('connection_status', {'success': success, 'msg': msg})
 
-@socketio.on('ptz_command')
-def handle_ptz(data):
+def configured_target():
+    host = os.environ.get('VISCA_HOST', '').strip()
+    if not host:
+        return None
+    protocol = os.environ.get('VISCA_PROTOCOL', 'sony-udp').strip()
+    if protocol not in PROTOCOLS:
+        raise ValueError(f"VISCA_PROTOCOL must be one of {', '.join(PROTOCOLS)}, not {protocol!r}")
+    mode = PROTOCOLS[protocol]
+    port = int(os.environ.get('VISCA_PORT') or DEFAULT_PORTS[mode])
+    return {'mode': mode, 'ip': host, 'port': port}
+
+
+def connect(target):
+    if target['mode'] == 'sony_udp':
+        local_port = int(os.environ.get('VISCA_LOCAL_PORT') or 52381)
+        return ptz.connect_sony_udp(target['ip'], target['port'], local_port)
+    if target['mode'] == 'tcp':
+        return ptz.connect_tcp(target['ip'], target['port'])
+    return ptz.connect_serial(target['port'], int(target['baud']))
+
+
+def ensure_connected():
+    """Connects to the configured camera unless already connected to it."""
+    target = configured_target()
+    if target is None:
+        if ptz.connection_type is None:
+            return False, "Disconnected"
+        return True, f"Connected: {ptz.target}"
+    if ptz.connection_type == target['mode'] and ptz.target == target:
+        return True, f"Connected: {target['ip']}:{target['port']}"
+    return connect(target)
+
+
+def status():
+    target = configured_target()
+    return {
+        'connected': ptz.connection_type is not None,
+        'target': ptz.target,
+        'configured': target,
+        'locked': target is not None,
+    }
+
+
+def dispatch(data):
     cmd = data['cmd']
     val = data.get('val', 0)
     p_spd = data.get('p_spd')
@@ -224,6 +297,62 @@ def handle_ptz(data):
     elif cmd == 'format_set':      ptz.set_video_format(int(val))
     
     elif cmd.startswith('led_'):   ptz.call_led(cmd.split('_')[1])
+    else:
+        return False
+    return True
+
+
+@app.route('/')
+def index():
+    return render_template('index.html')
+
+@app.route('/healthz')
+def healthz():
+    return 'ok'
+
+@app.route('/api/status')
+def api_status():
+    return jsonify(status())
+
+@app.route('/api/connect', methods=['POST'])
+def api_connect():
+    success, msg = ensure_connected()
+    return jsonify(dict(status(), success=success, msg=msg)), (200 if success else 502)
+
+@app.route('/api/command', methods=['POST'])
+def api_command():
+    data = request.get_json(silent=True) or {}
+    if not isinstance(data.get('cmd'), str):
+        return jsonify({'success': False, 'msg': 'body needs a "cmd" string'}), 400
+    success, msg = ensure_connected()
+    if not success:
+        return jsonify({'success': False, 'msg': msg}), 502
+    if not dispatch(data):
+        return jsonify({'success': False, 'msg': f"unknown cmd {data['cmd']!r}"}), 400
+    return jsonify({'success': True})
+
+@socketio.on('connect')
+def handle_socket_connect():
+    # Every page load connects the socket, and with it the camera.
+    success, msg = ensure_connected()
+    emit('camera_config', status())
+    emit('connection_status', {'success': success, 'msg': msg})
+
+@socketio.on('connect_camera')
+def handle_connect(data):
+    if configured_target() is not None:
+        success, msg = ensure_connected()
+    elif data['mode'] in ('tcp', 'sony_udp'):
+        success, msg = connect({'mode': data['mode'], 'ip': data['ip'], 'port': int(data['port'])})
+    else:
+        success, msg = ptz.connect_serial(data['port'], int(data['baud']))
+    emit('camera_config', status())
+    emit('connection_status', {'success': success, 'msg': msg})
+
+@socketio.on('ptz_command')
+def handle_ptz(data):
+    if ensure_connected()[0]:
+        dispatch(data)
 
 @socketio.on('config_change')
 def handle_config(data):
@@ -233,4 +362,8 @@ def handle_config(data):
         ptz.ir_control(data['ir_disable'])
 
 if __name__ == '__main__':
-    socketio.run(app, host='0.0.0.0', port=5000, debug=True)
+    if configured_target() is not None:
+        print(ensure_connected()[1])
+    socketio.run(app, host=os.environ.get('LISTEN_HOST', '0.0.0.0'),
+                 port=int(os.environ.get('LISTEN_PORT', '5000')),
+                 debug=os.environ.get('FLASK_DEBUG') == '1')
