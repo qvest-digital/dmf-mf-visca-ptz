@@ -386,8 +386,8 @@
 
             <div class="conn-row">
                 <select id="conn-mode" onchange="toggleConnFields()">
-                    <option value="sony_udp">Network (Sony VISCA over IP)</option>
                     <option value="tcp">Network (TCP)</option>
+                    <option value="sony_udp">Network (Sony VISCA over IP)</option>
                     <option value="serial">Serial (RS232)</option>
                 </select>
                 <div id="tcp-fields" class="conn-group active">
@@ -567,14 +567,26 @@
         const socket = io();
 
         // --- UI & CONNECTION LOGIC ---
+        const DEFAULT_PORTS = { tcp: '5678', sony_udp: '52381' };
+
         function toggleConnFields() {
             const mode = document.getElementById('conn-mode').value;
+            // Follow the mode with the port while it is still another mode's default.
+            const port = document.getElementById('conn-port');
+            if (DEFAULT_PORTS[mode] && Object.values(DEFAULT_PORTS).includes(port.value)) port.value = DEFAULT_PORTS[mode];
             document.getElementById('tcp-fields').classList.toggle('active', mode === 'tcp' || mode === 'sony_udp');
             document.getElementById('serial-fields').classList.toggle('active', mode === 'serial');
         }
 
         function connectCamera() {
             const mode = document.getElementById('conn-mode').value;
+            if (document.getElementById('conn-mode').disabled) {
+                // Bound to one camera: the server reconnects to it, and the
+                // settings saved for this origin stay as they were.
+                document.getElementById('status-msg').innerText = "Connecting...";
+                socket.emit('connect_camera', { mode: mode });
+                return;
+            }
             localStorage.setItem('visca_mode', mode);
             
             let data = { mode: mode };

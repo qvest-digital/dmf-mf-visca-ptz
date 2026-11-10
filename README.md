@@ -112,6 +112,8 @@ without letting it be changed.
   `VISCA_LOCAL_PORT`  `52381`                Local UDP port; Sony cameras reply to 52381
   `LISTEN_HOST`       `0.0.0.0`              Web server bind address
   `LISTEN_PORT`       `5000`                 Web server port
+  `CORS_ALLOWED_ORIGINS` same origin         Comma-separated origins allowed to open the socket
+  `SECRET_KEY`        random per start       Flask session key
 
 ``` bash
 docker build -t visca-ptz .
@@ -128,7 +130,11 @@ docker run -p 5000:5000 -e VISCA_HOST=192.168.0.100 visca-ptz
   `/healthz`            GET                                        `ok`
 
 A Sony camera answers from port 65000 to port 52381. Behind NAT those
-replies are lost; commands still execute.
+replies are lost; commands still execute. Over UDP, `connected` means a
+socket towards the camera is open, not that the camera answered.
+`POST /api/connect` and the Reconnect button reopen it and reset the
+camera's sequence numbering. One controller per camera: two would
+interleave their sequence numbers.
 
 ------------------------------------------------------------------------
 

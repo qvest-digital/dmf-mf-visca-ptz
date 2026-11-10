@@ -1,13 +1,22 @@
+# Before anything else imports socket or time: unpatched, a blocking connect
+# or sleep stalls the event loop and with it every client and /healthz.
+import eventlet
+eventlet.monkey_patch()
+
 import os
 import socket
 import serial
+import threading
 import time
 from flask import Flask, jsonify, render_template, request
 from flask_socketio import SocketIO, emit
 
 app = Flask(__name__)
-app.config['SECRET_KEY'] = 'secret_ptz_key'
-socketio = SocketIO(app, async_mode='eventlet', cors_allowed_origins='*')
+app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY') or os.urandom(32).hex()
+# Same origin unless listed: any page a browser has open could otherwise drive
+# the camera through it.
+_origins = [o.strip() for o in os.environ.get('CORS_ALLOWED_ORIGINS', '').split(',') if o.strip()]
+socketio = SocketIO(app, async_mode='eventlet', cors_allowed_origins=_origins or None)
 
 class ViscaController:
     def __init__(self):
@@ -17,6 +26,7 @@ class ViscaController:
         self.peer = None
         self.seq = 0
         self.target = None
+        self.sent = 0
         self.address = 1 
         self.pan_speed = 0x0C 
         self.tilt_speed = 0x0A 
@@ -24,7 +34,10 @@ class ViscaController:
 
     def _to_nibbles(self, val):
         # Converte un intero in 4 nibbles VISCA (es. 50 -> 0x32 -> 00 00 03 02)
-        hex_str = f"{int(val):04x}" 
+        val = int(val)
+        if not 0 <= val <= 0xFFFF:
+            raise ValueError(f"{val} does not fit four VISCA nibbles")
+        hex_str = f"{val:04x}" 
         return bytes([int(c, 16) for c in hex_str])
 
     def _send_raw(self, packet):
@@ -38,18 +51,23 @@ class ViscaController:
                 # payload length and a sequence number ahead of the VISCA bytes.
                 self.seq = (self.seq + 1) & 0xFFFFFFFF
                 header = b'\x01\x00' + len(packet).to_bytes(2, 'big') + self.seq.to_bytes(4, 'big')
-                self.sock.sendto(header + packet, self.peer)
+                self.sock.send(header + packet)
+            else:
+                return False
+            self.sent += 1
+            return True
         except Exception as e:
             print(f"TX Raw Error: {e}")
             if self.connection_type == 'tcp':
-                # A broken TCP link is reopened by the next ensure_connected().
+                # The link is gone: the next ensure_connected() reopens it.
                 self.connection_type = None
+            return False
 
     def send_visca(self, payload):
         header = bytes([0x80 + self.address])
         terminator = b'\xFF'
         full_packet = header + payload + terminator
-        self._send_raw(full_packet)
+        return self._send_raw(full_packet)
 
     def init_camera(self):
         """Sequenza di avvio obbligatoria per Cisco PrecisionHD"""
@@ -62,7 +80,12 @@ class ViscaController:
         # 3. Disabilita IR per evitare latenza sul brandeggio
         self.ir_control(True)
 
+    def _reset(self):
+        self.connection_type = None
+        self.target = None
+
     def connect_serial(self, port, baudrate=9600):
+        self._reset()
         try:
             if self.sock: self.sock.close()
             self.ser = serial.Serial(port, baudrate, timeout=0.1)
@@ -74,26 +97,30 @@ class ViscaController:
             return False, str(e)
 
     def connect_sony_udp(self, ip, port=52381, local_port=52381):
+        self._reset()
         try:
             if self.ser: self.ser.close()
             if self.sock: self.sock.close()
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             # The camera answers on UDP 52381 whatever the sender's source
-            # port, so replies only arrive on a socket bound there.
+            # port. Nothing here reads the answers; binding there keeps them
+            # from being refused with ICMP where they do arrive.
             self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             self.sock.bind(('0.0.0.0', int(local_port)))
+            # Resolves the host once rather than on every packet.
+            self.sock.connect((ip, int(port)))
             self.peer = (ip, int(port))
             self.seq = 0
             # Control command RESET: the camera expects sequence numbers from 1 again.
-            self.sock.sendto(b'\x02\x00\x00\x01\x00\x00\x00\x00\x01', self.peer)
+            self.sock.send(b'\x02\x00\x00\x01\x00\x00\x00\x00\x01')
             self.connection_type = 'sony_udp'
             self.target = {'mode': 'sony_udp', 'ip': ip, 'port': int(port)}
             return True, f"Connected Sony VISCA over IP: {ip}:{port}"
         except Exception as e:
-            self.connection_type = None
             return False, str(e)
 
     def connect_tcp(self, ip, port=5678):
+        self._reset()
         try:
             if self.ser: self.ser.close()
             if self.sock: self.sock.close()
@@ -215,6 +242,10 @@ class ViscaController:
 
 ptz = ViscaController()
 
+# One camera, one sequence of packets: connecting swaps the socket and every
+# Sony packet takes the next sequence number, so callers hold this throughout.
+lock = threading.RLock()
+
 # A deployment binds the controller to one camera through the environment.
 # With VISCA_HOST set the target is fixed: the UI and the API connect to it
 # and cannot point the controller anywhere else.
@@ -243,20 +274,24 @@ def connect(target):
     return ptz.connect_serial(target['port'], int(target['baud']))
 
 
-def ensure_connected():
-    """Connects to the configured camera unless already connected to it."""
+def ensure_connected(force=False):
+    """Connects to the configured camera unless already connected to it.
+    force reconnects anyway, which for Sony VISCA over IP also resets the
+    camera's sequence numbering."""
     target = configured_target()
     if target is None:
         if ptz.connection_type is None:
             return False, "Disconnected"
         return True, f"Connected: {ptz.target}"
-    if ptz.connection_type == target['mode'] and ptz.target == target:
+    if not force and ptz.connection_type == target['mode'] and ptz.target == target:
         return True, f"Connected: {target['ip']}:{target['port']}"
     return connect(target)
 
 
 def status():
     target = configured_target()
+    # For UDP, connected means a socket is open towards the camera: there is
+    # no handshake, so it says nothing about whether the camera listens.
     return {
         'connected': ptz.connection_type is not None,
         'target': ptz.target,
@@ -265,41 +300,55 @@ def status():
     }
 
 
+COMMANDS = {
+    'move_raw', 'stop', 'zoom_tele', 'zoom_wide', 'zoom_stop',
+    'focus_far', 'focus_near', 'focus_stop', 'focus_auto', 'focus_manual',
+    'exposure_auto', 'exposure_manual', 'iris_set', 'gain_set', 'shutter_set',
+    'wb_auto', 'wb_manual', 'wb_table_set', 'backlight_on', 'backlight_off',
+    'flip_on', 'flip_off', 'format_set', 'led_on', 'led_off', 'led_blink',
+} | {'move_' + d for d in ('stop', 'up', 'down', 'left', 'right', 'upleft', 'upright', 'downleft', 'downright')}
+
+
 def dispatch(data):
+    """Sends one command. Returns the number of packets sent; raises
+    ValueError for an unknown command or a value that is no number."""
     cmd = data['cmd']
+    if cmd not in COMMANDS:
+        raise ValueError(f"unknown cmd {cmd!r}")
     val = data.get('val', 0)
     p_spd = data.get('p_spd')
     t_spd = data.get('t_spd')
     z_spd = data.get('z_spd')
-    
-    if cmd == 'move_raw':
-        ptz.move_raw(int(data.get('p_dir', 0)), int(data.get('t_dir', 0)), p_spd, t_spd)
-    elif cmd.startswith('move_'): ptz.move(cmd.split('_')[1], p_spd, t_spd)
-    elif cmd == 'stop':           ptz.move('stop')
-    elif cmd.startswith('zoom_'): ptz.zoom(cmd.split('_')[1], z_spd)
-    elif cmd.startswith('focus_'): ptz.focus(cmd.split('_')[1])
-    
-    elif cmd == 'exposure_auto':   ptz.set_exposure('auto')
-    elif cmd == 'exposure_manual': ptz.set_exposure('manual')
-    elif cmd == 'iris_set':        ptz.set_iris_direct(int(val))
-    elif cmd == 'gain_set':        ptz.set_gain_direct(int(val))
-    elif cmd == 'shutter_set':     ptz.set_shutter_direct(int(val))
-    
-    elif cmd == 'wb_auto':         ptz.set_wb('auto')
-    elif cmd == 'wb_manual':       ptz.set_wb('manual')
-    elif cmd == 'wb_table_set':    ptz.set_wb_table(int(val))
-    
-    # Nuovi controlli Cisco
-    elif cmd == 'backlight_on':    ptz.set_backlight('on')
-    elif cmd == 'backlight_off':   ptz.set_backlight('off')
-    elif cmd == 'flip_on':         ptz.set_flip('on')
-    elif cmd == 'flip_off':        ptz.set_flip('off')
-    elif cmd == 'format_set':      ptz.set_video_format(int(val))
-    
-    elif cmd.startswith('led_'):   ptz.call_led(cmd.split('_')[1])
-    else:
-        return False
-    return True
+    before = ptz.sent
+    try:
+        if cmd == 'move_raw':
+            ptz.move_raw(int(data.get('p_dir', 0)), int(data.get('t_dir', 0)), p_spd, t_spd)
+        elif cmd.startswith('move_'): ptz.move(cmd.split('_')[1], p_spd, t_spd)
+        elif cmd == 'stop':           ptz.move('stop')
+        elif cmd.startswith('zoom_'): ptz.zoom(cmd.split('_')[1], z_spd)
+        elif cmd.startswith('focus_'): ptz.focus(cmd.split('_')[1])
+
+        elif cmd == 'exposure_auto':   ptz.set_exposure('auto')
+        elif cmd == 'exposure_manual': ptz.set_exposure('manual')
+        elif cmd == 'iris_set':        ptz.set_iris_direct(int(val))
+        elif cmd == 'gain_set':        ptz.set_gain_direct(int(val))
+        elif cmd == 'shutter_set':     ptz.set_shutter_direct(int(val))
+
+        elif cmd == 'wb_auto':         ptz.set_wb('auto')
+        elif cmd == 'wb_manual':       ptz.set_wb('manual')
+        elif cmd == 'wb_table_set':    ptz.set_wb_table(int(val))
+
+        # Nuovi controlli Cisco
+        elif cmd == 'backlight_on':    ptz.set_backlight('on')
+        elif cmd == 'backlight_off':   ptz.set_backlight('off')
+        elif cmd == 'flip_on':         ptz.set_flip('on')
+        elif cmd == 'flip_off':        ptz.set_flip('off')
+        elif cmd == 'format_set':      ptz.set_video_format(int(val))
+
+        elif cmd.startswith('led_'):   ptz.call_led(cmd.split('_')[1])
+    except (TypeError, ValueError) as e:
+        raise ValueError(f"{cmd}: {e}")
+    return ptz.sent - before
 
 
 @app.route('/')
@@ -316,54 +365,68 @@ def api_status():
 
 @app.route('/api/connect', methods=['POST'])
 def api_connect():
-    success, msg = ensure_connected()
-    return jsonify(dict(status(), success=success, msg=msg)), (200 if success else 502)
+    with lock:
+        success, msg = ensure_connected(force=True)
+        return jsonify(dict(status(), success=success, msg=msg)), (200 if success else 502)
 
 @app.route('/api/command', methods=['POST'])
 def api_command():
     data = request.get_json(silent=True) or {}
     if not isinstance(data.get('cmd'), str):
         return jsonify({'success': False, 'msg': 'body needs a "cmd" string'}), 400
-    success, msg = ensure_connected()
-    if not success:
-        return jsonify({'success': False, 'msg': msg}), 502
-    if not dispatch(data):
-        return jsonify({'success': False, 'msg': f"unknown cmd {data['cmd']!r}"}), 400
+    with lock:
+        success, msg = ensure_connected()
+        if not success:
+            return jsonify({'success': False, 'msg': msg}), 502
+        try:
+            sent = dispatch(data)
+        except ValueError as e:
+            return jsonify({'success': False, 'msg': str(e)}), 400
+    if not sent:
+        return jsonify({'success': False, 'msg': 'nothing was sent to the camera'}), 502
     return jsonify({'success': True})
 
 @socketio.on('connect')
 def handle_socket_connect():
     # Every page load connects the socket, and with it the camera.
-    success, msg = ensure_connected()
-    emit('camera_config', status())
+    with lock:
+        success, msg = ensure_connected()
+        emit('camera_config', status())
     emit('connection_status', {'success': success, 'msg': msg})
 
 @socketio.on('connect_camera')
 def handle_connect(data):
-    if configured_target() is not None:
-        success, msg = ensure_connected()
-    elif data['mode'] in ('tcp', 'sony_udp'):
-        success, msg = connect({'mode': data['mode'], 'ip': data['ip'], 'port': int(data['port'])})
-    else:
-        success, msg = ptz.connect_serial(data['port'], int(data['baud']))
-    emit('camera_config', status())
+    with lock:
+        if configured_target() is not None:
+            success, msg = ensure_connected(force=True)
+        elif data['mode'] in ('tcp', 'sony_udp'):
+            success, msg = connect({'mode': data['mode'], 'ip': data['ip'], 'port': int(data['port'])})
+        else:
+            success, msg = ptz.connect_serial(data['port'], int(data['baud']))
+        emit('camera_config', status())
     emit('connection_status', {'success': success, 'msg': msg})
 
 @socketio.on('ptz_command')
 def handle_ptz(data):
-    if ensure_connected()[0]:
-        dispatch(data)
+    with lock:
+        if ensure_connected()[0]:
+            try:
+                dispatch(data)
+            except ValueError as e:
+                print(f"Rejected command: {e}")
 
 @socketio.on('config_change')
 def handle_config(data):
-    if 'pan_speed' in data:
-        ptz.set_speed(data['pan_speed'], data['tilt_speed'], data['zoom_speed'])
-    if 'ir_disable' in data:
-        ptz.ir_control(data['ir_disable'])
+    with lock:
+        if 'pan_speed' in data:
+            ptz.set_speed(data['pan_speed'], data['tilt_speed'], data['zoom_speed'])
+        if 'ir_disable' in data:
+            ptz.ir_control(data['ir_disable'])
 
 if __name__ == '__main__':
     if configured_target() is not None:
-        print(ensure_connected()[1])
+        with lock:
+            print(ensure_connected()[1])
     socketio.run(app, host=os.environ.get('LISTEN_HOST', '0.0.0.0'),
                  port=int(os.environ.get('LISTEN_PORT', '5000')),
                  debug=os.environ.get('FLASK_DEBUG') == '1')
