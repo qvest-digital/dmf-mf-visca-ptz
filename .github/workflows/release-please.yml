@@ -1,0 +1,31 @@
+name: release-please
+
+# Conventional commits drive the version. Merging the PR release-please opens
+# cuts a vN tag, writes CHANGELOG.md and publishes a GitHub release, and that
+# published release is what build.yml tags an image with.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: release-please
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    steps:
+      # RELEASE_PLEASE_TOKEN rather than GITHUB_TOKEN: the organisation does not
+      # let Actions open pull requests, and a release published with
+      # GITHUB_TOKEN starts no further run, so build.yml would never tag the
+      # image with the release.
+      - uses: googleapis/release-please-action@v5
+        with:
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json

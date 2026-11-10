@@ -387,6 +387,7 @@
             <div class="conn-row">
                 <select id="conn-mode" onchange="toggleConnFields()">
                     <option value="tcp">Network (TCP)</option>
+                    <option value="sony_udp">Network (Sony VISCA over IP)</option>
                     <option value="serial">Serial (RS232)</option>
                 </select>
                 <div id="tcp-fields" class="conn-group active">
@@ -402,7 +403,7 @@
                         <option value="115200">115200</option>
                     </select>
                 </div>
-                <button class="primary" onclick="connectCamera()">Connect</button>
+                <button class="primary" id="conn-btn" onclick="connectCamera()">Connect</button>
             </div>
             <div id="status-msg">Disconnected</div>
             <div id="gp-status"><i class="fas fa-gamepad"></i> Gamepad Connected</div>
@@ -566,18 +567,30 @@
         const socket = io();
 
         // --- UI & CONNECTION LOGIC ---
+        const DEFAULT_PORTS = { tcp: '5678', sony_udp: '52381' };
+
         function toggleConnFields() {
             const mode = document.getElementById('conn-mode').value;
-            document.getElementById('tcp-fields').classList.toggle('active', mode === 'tcp');
+            // Follow the mode with the port while it is still another mode's default.
+            const port = document.getElementById('conn-port');
+            if (DEFAULT_PORTS[mode] && Object.values(DEFAULT_PORTS).includes(port.value)) port.value = DEFAULT_PORTS[mode];
+            document.getElementById('tcp-fields').classList.toggle('active', mode === 'tcp' || mode === 'sony_udp');
             document.getElementById('serial-fields').classList.toggle('active', mode === 'serial');
         }
 
         function connectCamera() {
             const mode = document.getElementById('conn-mode').value;
+            if (document.getElementById('conn-mode').disabled) {
+                // Bound to one camera: the server reconnects to it, and the
+                // settings saved for this origin stay as they were.
+                document.getElementById('status-msg').innerText = "Connecting...";
+                socket.emit('connect_camera', { mode: mode });
+                return;
+            }
             localStorage.setItem('visca_mode', mode);
             
             let data = { mode: mode };
-            if (mode === 'tcp') {
+            if (mode === 'tcp' || mode === 'sony_udp') {
                 data.ip = document.getElementById('conn-ip').value;
                 data.port = document.getElementById('conn-port').value;
                 localStorage.setItem('visca_ip', data.ip);
@@ -593,6 +606,7 @@
         }
 
         function loadSavedConnection() {
+            if (document.getElementById('conn-mode').disabled) return;
             if(localStorage.getItem('visca_mode')) document.getElementById('conn-mode').value = localStorage.getItem('visca_mode');
             if(localStorage.getItem('visca_ip')) document.getElementById('conn-ip').value = localStorage.getItem('visca_ip');
             if(localStorage.getItem('visca_port')) document.getElementById('conn-port').value = localStorage.getItem('visca_port');
@@ -602,6 +616,19 @@
         }
         
         document.addEventListener("DOMContentLoaded", loadSavedConnection);
+
+        // A deployment bound to one camera fixes the target: show it and keep
+        // only the button, which reconnects to that same camera.
+        socket.on('camera_config', (cfg) => {
+            if (!cfg.locked) return;
+            const t = cfg.configured;
+            document.getElementById('conn-mode').value = t.mode;
+            document.getElementById('conn-ip').value = t.ip;
+            document.getElementById('conn-port').value = t.port;
+            toggleConnFields();
+            ['conn-mode', 'conn-ip', 'conn-port'].forEach(id => document.getElementById(id).disabled = true);
+            document.getElementById('conn-btn').innerText = 'Reconnect';
+        });
 
         socket.on('connection_status', (data) => {
             const el = document.getElementById('status-msg');

@@ -10,7 +10,8 @@ A modern, responsive **Web-based controller for VISCA PTZ cameras** with
 full Gamepad (Joystick) support.
 
 Designed for smooth, broadcast-style control via browser, supporting
-both **TCP (IP VISCA)** and **Serial (RS-232)** connections.
+**Sony VISCA over IP (UDP)**, **TCP (IP VISCA)** and **Serial (RS-232)**
+connections.
 
 ------------------------------------------------------------------------
 
@@ -29,7 +30,8 @@ both **TCP (IP VISCA)** and **Serial (RS-232)** connections.
 -   🌐 **Web-Based Interface**
     -   Works from any device on the network
     -   Touch and mouse friendly
--   🔌 **Dual Connection Support**
+-   🔌 **Connection Support**
+    -   Sony VISCA over IP (UDP 52381)
     -   TCP/IP (VISCA over IP)
     -   Serial (RS-232)
 -   ⚡ **Low-Latency Real-Time Control**
@@ -96,6 +98,46 @@ Or from another device:
 
 ------------------------------------------------------------------------
 
+## 📌 Binding to One Camera
+
+With `VISCA_HOST` set, the controller connects to that camera at startup,
+on every page load and on every API call, and the UI shows the target
+without letting it be changed.
+
+  Variable            Default                Meaning
+  ------------------- ---------------------- ----------------------------------
+  `VISCA_HOST`        unset                  Camera address; unset leaves the UI free
+  `VISCA_PROTOCOL`    `sony-udp`             `sony-udp` or `tcp`
+  `VISCA_PORT`        `52381` / `5678`       Camera port, per protocol
+  `VISCA_LOCAL_PORT`  `52381`                Local UDP port; Sony cameras reply to 52381
+  `LISTEN_HOST`       `0.0.0.0`              Web server bind address
+  `LISTEN_PORT`       `5000`                 Web server port
+  `CORS_ALLOWED_ORIGINS` same origin         Comma-separated origins allowed to open the socket
+  `SECRET_KEY`        random per start       Flask session key
+
+``` bash
+docker build -t visca-ptz .
+docker run -p 5000:5000 -e VISCA_HOST=192.168.0.100 visca-ptz
+```
+
+### HTTP API
+
+  Endpoint              Method   Body                              Result
+  --------------------- -------- --------------------------------- -------------------------------
+  `/api/status`         GET                                        target, configured, connected
+  `/api/connect`        POST                                       connects to the configured camera
+  `/api/command`        POST     `{"cmd": "move_left", ...}`       same commands as the UI socket
+  `/healthz`            GET                                        `ok`
+
+A Sony camera answers from port 65000 to port 52381. Behind NAT those
+replies are lost; commands still execute. Over UDP, `connected` means a
+socket towards the camera is open, not that the camera answered.
+`POST /api/connect` and the Reconnect button reopen it and reset the
+camera's sequence numbering. One controller per camera: two would
+interleave their sequence numbers.
+
+------------------------------------------------------------------------
+
 ## 🎮 Gamepad Controls
 
   Control         Function
@@ -144,6 +186,8 @@ const MAX_TILT = 20;
 visca-ptz-web-controller/
 ├── app.py              # Flask backend + VISCA engine
 ├── requirements.txt    # Python dependencies
+├── Dockerfile          # Container image
+├── tests/              # Unit tests (python -m unittest discover -s tests)
 ├── templates/
 │   └── index.html      # Frontend (HTML + JS + Gamepad logic)
 ```
