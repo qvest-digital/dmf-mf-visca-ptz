@@ -128,6 +128,7 @@ docker run -p 5000:5000 -e VISCA_HOST=192.168.0.100 visca-ptz
   `/api/connect`        POST                                       connects to the configured camera
   `/api/command`        POST     `{"cmd": "move_left", ...}`       same commands as the UI socket
   `/healthz`            GET                                        `ok`
+  `/auth/login`, `/auth/callback`, `/auth/logout`  GET              sign-in, with `OIDC_ISSUER` only
 
 A Sony camera answers from port 65000 to port 52381. Behind NAT those
 replies are lost; commands still execute. Over UDP, `connected` means a
@@ -135,6 +136,42 @@ socket towards the camera is open, not that the camera answered.
 `POST /api/connect` and the Reconnect button reopen it and reset the
 camera's sequence numbering. One controller per camera: two would
 interleave their sequence numbers.
+
+### Sign-in
+
+With `OIDC_ISSUER` set, the page, the Socket.IO channel and `/api/*` need
+a sign-in through an OpenID Connect provider: the authorization code flow
+with PKCE (S256), state and nonce, the ID token verified against the
+issuer's discovery document and keys. The issuer is contacted on the first
+sign-in, not at start; while it is unreachable `/auth/login` answers `503`
+and logs why. `/healthz` stays open for probes.
+
+  Variable                   Default                  Meaning
+  -------------------------- ------------------------ ----------------------------------
+  `OIDC_ISSUER`              unset                    Issuer URL; unset leaves sign-in off and the controller open
+  `OIDC_CLIENT_ID`           none, required           The OIDC client
+  `OIDC_REDIRECT_URL`        none, required           `<public origin>/auth/callback` as the browser reaches it; never derived from forwarded headers
+  `OIDC_CLIENT_SECRET_FILE`  unset                    File holding the client secret; unset, the client is public and authenticated by PKCE alone
+  `OIDC_ROLE_CLAIM`          `groups`                 ID token claim holding the user's roles or groups; a dotted path reaches into nested claims
+  `OIDC_SCOPES`              `openid,profile,email`   Scopes asked for, comma-separated
+  `OIDC_OPERATOR_ROLE`       `visca-ptz-operator`     Role claim value that may control the camera; a group path counts by its last element
+
+A user whose role claim holds the operator role controls the camera. Any
+other signed-in user sees the page and `GET /api/status`; the camera is not
+connected for them, their socket commands are dropped and `POST /api/*`
+answers `403`. A `POST` to `/api/*` also has to come from the redirect URL's
+origin, by its `Origin` header or, without one, `Sec-Fetch-Site:
+same-origin`. Without a session, `/` redirects to `/auth/login`, `/api/*`
+answers `401` and the socket is refused.
+
+Sessions are held in memory and named by Flask's signed session cookie,
+`HttpOnly`, `SameSite=Lax` and, when the redirect URL is `https`, `Secure`.
+When the ID token's `exp` has passed, the next request renews it with the
+refresh token. A session ends when the issuer refuses the refresh token, its
+`refresh_expires_in` passes, at `/auth/logout`, or when the process restarts;
+an open page is then sent to sign in again. `/auth/logout` also ends the
+session at the issuer when it advertises an `end_session_endpoint`. There is
+no bearer-token access: a caller of `/api/*` holds a browser session.
 
 ------------------------------------------------------------------------
 
@@ -185,6 +222,7 @@ const MAX_TILT = 20;
 ``` text
 visca-ptz-web-controller/
 ├── app.py              # Flask backend + VISCA engine
+├── auth.py             # OpenID Connect sign-in
 ├── requirements.txt    # Python dependencies
 ├── Dockerfile          # Container image
 ├── tests/              # Unit tests (python -m unittest discover -s tests)

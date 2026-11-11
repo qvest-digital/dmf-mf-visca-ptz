@@ -3,16 +3,24 @@
 import eventlet
 eventlet.monkey_patch()
 
+import functools
 import os
 import socket
 import serial
 import threading
 import time
-from flask import Flask, jsonify, render_template, request
-from flask_socketio import SocketIO, emit
+from flask import Flask, abort, jsonify, redirect, render_template, request
+from flask_socketio import ConnectionRefusedError, SocketIO, disconnect, emit
+
+import auth as signin
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY') or os.urandom(32).hex()
+# None: no sign-in, and the controller is open to whoever reaches it.
+auth = signin.from_env(os.environ)
+if auth is not None:
+    app.config.update(SESSION_COOKIE_SAMESITE='Lax', SESSION_COOKIE_SECURE=auth.secure)
+    print(f"sign-in on: issuer {auth.issuer}, client {auth.client_id}")
 # Same origin unless listed: any page a browser has open could otherwise drive
 # the camera through it.
 _origins = [o.strip() for o in os.environ.get('CORS_ALLOWED_ORIGINS', '').split(',') if o.strip()]
@@ -351,25 +359,108 @@ def dispatch(data):
     return ptz.sent - before
 
 
+def deny(code, msg):
+    return jsonify({'error': msg}), code
+
+
+def read_only():
+    return f"read only: controlling the camera needs the {auth.operator_role} role"
+
+
+def page(view):
+    """Sends a browser without a session to sign in."""
+    @functools.wraps(view)
+    def wrapped(*args, **kwargs):
+        if auth is not None and auth.current() is None:
+            return redirect('/auth/login')
+        return view(*args, **kwargs)
+    return wrapped
+
+
+def viewer(view):
+    """Answers 401 to a caller without a session."""
+    @functools.wraps(view)
+    def wrapped(*args, **kwargs):
+        if auth is not None and auth.current() is None:
+            return deny(401, 'sign in at /auth/login')
+        return view(*args, **kwargs)
+    return wrapped
+
+
+def operator(view):
+    """Lets an operator move the camera, from the controller's own page."""
+    @functools.wraps(view)
+    def wrapped(*args, **kwargs):
+        if auth is not None:
+            g = auth.current()
+            if g is None:
+                return deny(401, 'sign in at /auth/login')
+            if not auth.same_origin():
+                return deny(403, f"a command has to come from {auth.origin}")
+            if g.role != signin.OPERATOR:
+                return deny(403, read_only())
+        return view(*args, **kwargs)
+    return wrapped
+
+
+def socket_operator():
+    """Whether this socket may move the camera. A socket whose session has
+    ended is told to sign in again and dropped; one of a viewer is told it
+    is read only."""
+    if auth is None:
+        return True
+    g = auth.current()
+    if g is None:
+        emit('auth_required')
+        disconnect()
+        return False
+    if g.role != signin.OPERATOR:
+        emit('connection_status', {'success': False, 'msg': read_only()})
+        return False
+    return True
+
+
 @app.route('/')
+@page
 def index():
-    return render_template('index.html')
+    return render_template('index.html', sign_out=auth is not None)
 
 @app.route('/healthz')
 def healthz():
     return 'ok'
 
+@app.route('/auth/login')
+def auth_login():
+    if auth is None:
+        abort(404)
+    return auth.login()
+
+@app.route('/auth/callback')
+def auth_callback():
+    if auth is None:
+        abort(404)
+    return auth.callback()
+
+@app.route('/auth/logout')
+def auth_logout():
+    if auth is None:
+        abort(404)
+    return auth.logout()
+
 @app.route('/api/status')
+@viewer
 def api_status():
     return jsonify(status())
 
 @app.route('/api/connect', methods=['POST'])
+@operator
 def api_connect():
     with lock:
         success, msg = ensure_connected(force=True)
         return jsonify(dict(status(), success=success, msg=msg)), (200 if success else 502)
 
 @app.route('/api/command', methods=['POST'])
+@operator
 def api_command():
     data = request.get_json(silent=True) or {}
     if not isinstance(data.get('cmd'), str):
@@ -388,6 +479,16 @@ def api_command():
 
 @socketio.on('connect')
 def handle_socket_connect():
+    if auth is not None:
+        g = auth.current()
+        if g is None:
+            raise ConnectionRefusedError('unauthorized')
+        if g.role != signin.OPERATOR:
+            # A viewer sees the target but does not connect the camera.
+            with lock:
+                emit('camera_config', status())
+            emit('connection_status', {'success': False, 'msg': read_only()})
+            return
     # Every page load connects the socket, and with it the camera.
     with lock:
         success, msg = ensure_connected()
@@ -396,6 +497,8 @@ def handle_socket_connect():
 
 @socketio.on('connect_camera')
 def handle_connect(data):
+    if not socket_operator():
+        return
     with lock:
         if configured_target() is not None:
             success, msg = ensure_connected(force=True)
@@ -408,6 +511,8 @@ def handle_connect(data):
 
 @socketio.on('ptz_command')
 def handle_ptz(data):
+    if not socket_operator():
+        return
     with lock:
         if ensure_connected()[0]:
             try:
@@ -417,6 +522,8 @@ def handle_ptz(data):
 
 @socketio.on('config_change')
 def handle_config(data):
+    if not socket_operator():
+        return
     with lock:
         if 'pan_speed' in data:
             ptz.set_speed(data['pan_speed'], data['tilt_speed'], data['zoom_speed'])
