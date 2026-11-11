@@ -142,9 +142,11 @@ interleave their sequence numbers.
 With `OIDC_ISSUER` set, the page, the Socket.IO channel and `/api/*` need
 a sign-in through an OpenID Connect provider: the authorization code flow
 with PKCE (S256), state and nonce, the ID token verified against the
-issuer's discovery document and keys. The issuer is contacted on the first
-sign-in, not at start; while it is unreachable `/auth/login` answers `503`
-and logs why. `/healthz` stays open for probes.
+issuer's discovery document and keys, with 60 seconds of clock skew allowed
+on `exp` and `iat`. The issuer is contacted on the first sign-in, not at
+start; while it is unreachable `/auth/login` answers `503`, and when its
+discovery document names another issuer `502`, each logging why. `/healthz`
+stays open for probes.
 
   Variable                   Default                  Meaning
   -------------------------- ------------------------ ----------------------------------
@@ -167,9 +169,12 @@ answers `401` and the socket is refused.
 Sessions are held in memory and named by Flask's signed session cookie,
 `HttpOnly`, `SameSite=Lax` and, when the redirect URL is `https`, `Secure`.
 When the ID token's `exp` has passed, the next request renews it with the
-refresh token. A session ends when the issuer refuses the refresh token, its
-`refresh_expires_in` passes, at `/auth/logout`, or when the process restarts;
-an open page is then sent to sign in again. `/auth/logout` also ends the
+refresh token. A session ends when the issuer refuses the refresh token with
+an OAuth error, the renewed ID token fails verification or names another
+`sub`, its `refresh_expires_in` passes, at `/auth/logout`, or when the
+process restarts; an open page is then sent to sign in again. While the
+issuer cannot be reached, a request that needs a renewal is treated as
+signed out and the session is kept for the next one. `/auth/logout` also ends the
 session at the issuer when it advertises an `end_session_endpoint`. There is
 no bearer-token access: a caller of `/api/*` holds a browser session.
 

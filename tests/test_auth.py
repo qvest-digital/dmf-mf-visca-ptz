@@ -22,7 +22,7 @@ class Issuer:
                                      stdout=subprocess.PIPE, text=True)
         port = int(self.proc.stdout.readline())
         self.base = f"http://127.0.0.1:{port}"
-        self.url = self.base + '/realms/dmf'
+        self.url = self.base + '/realms/test'
 
     def set(self, **state):
         requests.post(self.base + '/control', json=state, timeout=5).raise_for_status()
@@ -52,23 +52,28 @@ class SignIn(unittest.TestCase):
         app.ptz = app.ViscaController()
         self.addCleanup(lambda: app.ptz.sock and app.ptz.sock.close())
         self.clock = [time.time()]
-        self.auth = signin.Auth(issuer=self.issuer.url, client_id='visca-ptz.p-1.ptz',
+        self.auth = signin.Auth(issuer=self.issuer.url, client_id='visca-ptz',
                                 redirect_url=ORIGIN + '/auth/callback', role_claim='roles',
                                 now=lambda: self.clock[0])
-        previous = app.auth
-        app.auth = self.auth
-        self.addCleanup(setattr, app, 'auth', previous)
+        self.addCleanup(app.use, app.auth)
+        app.use(self.auth)
         self.client = app.app.test_client()
 
-    def sign_in(self):
+    def start(self):
+        """Starts a sign-in and shows the issuer what this browser was told
+        to send, so the code exchange can succeed; returns the state."""
         r = self.client.get('/auth/login')
         self.assertEqual(r.status_code, 302)
         query = {k: v[0] for k, v in parse_qs(urlsplit(r.location).query).items()}
         self.assertTrue(r.location.startswith(self.issuer.url + '/auth?'))
         self.assertEqual((query['code_challenge_method'], query['redirect_uri'], query['client_id']),
-                         ('S256', ORIGIN + '/auth/callback', 'visca-ptz.p-1.ptz'))
+                         ('S256', ORIGIN + '/auth/callback', 'visca-ptz'))
         self.issuer.set(nonce=query['nonce'], challenge=query['code_challenge'])
-        return self.client.get('/auth/callback', query_string={'state': query['state'], 'code': 'code'})
+        return query['state']
+
+    def sign_in(self):
+        state = self.start()
+        return self.client.get('/auth/callback', query_string={'state': state, 'code': 'code'})
 
     def received(self):
         packets = []
@@ -120,7 +125,7 @@ class SignIn(unittest.TestCase):
         self.assertEqual(self.command(**{'Sec-Fetch-Site': 'same-origin'}).status_code, 200)
 
     def test_a_user_without_the_operator_role_only_looks(self):
-        self.issuer.set(roles=['switchframe-viewer'])
+        self.issuer.set(roles=['some-viewer'])
         self.sign_in()
         self.assertEqual(self.client.get('/api/status').status_code, 200)
         r = self.command(Origin=ORIGIN)
@@ -186,12 +191,125 @@ class SignIn(unittest.TestCase):
         closed.bind(('127.0.0.1', 0))
         port = closed.getsockname()[1]
         closed.close()
-        app.auth = signin.Auth(issuer=f'http://127.0.0.1:{port}/realms/dmf', client_id='c',
-                               redirect_url=ORIGIN + '/auth/callback')
+        app.use(signin.Auth(issuer=f'http://127.0.0.1:{port}/realms/test', client_id='c',
+                            redirect_url=ORIGIN + '/auth/callback'))
         r = self.client.get('/auth/login')
         self.assertEqual(r.status_code, 503)
         self.assertIn(b'not reachable', r.data)
         self.assertEqual(self.client.get('/healthz').status_code, 200)
+
+    def test_a_viewer_cannot_change_camera_settings(self):
+        self.issuer.set(roles=['some-viewer'])
+        self.sign_in()
+        sio = app.socketio.test_client(app.app, flask_test_client=self.client)
+        sio.get_received()
+        speeds = (app.ptz.pan_speed, app.ptz.tilt_speed, app.ptz.zoom_speed)
+        sio.emit('config_change', {'ir_disable': True})
+        sio.emit('config_change', {'pan_speed': 1, 'tilt_speed': 1, 'zoom_speed': 1})
+        self.assertEqual(self.received(), [])
+        self.assertEqual((app.ptz.pan_speed, app.ptz.tilt_speed, app.ptz.zoom_speed), speeds)
+
+    def test_an_id_token_the_client_did_not_ask_for_is_refused(self):
+        good = {'audience': 'visca-ptz', 'iss': None, 'other_key': False, 'kid': 'k', 'alg': 'RS256'}
+        cases = {
+            'another audience': {'audience': 'another-client'},
+            'another issuer': {'iss': 'http://127.0.0.1:1/realms/test'},
+            'a bad signature': {'other_key': True},
+            'an unknown key id': {'kid': 'unknown'},
+            'HS256 with the public key as secret': {'alg': 'HS256'},
+            'no signature': {'alg': 'none'},
+        }
+        for name, forged in cases.items():
+            with self.subTest(name):
+                self.issuer.set(**dict(good, **forged))
+                self.assertEqual(self.sign_in().status_code, 403)
+                self.assertEqual(self.client.get('/api/status').status_code, 401)
+        self.issuer.set(**good)
+        self.assertEqual(self.sign_in().status_code, 302, 'the same flow with a proper token signs in')
+
+    def test_only_asymmetric_algorithms_are_accepted(self):
+        """The issuer's keys are public: a symmetric algorithm would take the
+        public key as a shared secret, and none takes no key at all."""
+        self.assertFalse([a for a in signin.ALGORITHMS if not a[:2] in ('RS', 'PS', 'ES')])
+
+    def test_the_issuers_clock_may_be_a_little_ahead(self):
+        self.issuer.set(iat_offset=5)
+        self.assertEqual(self.sign_in().status_code, 302)
+        self.assertEqual(self.client.get('/api/status').status_code, 200)
+
+    def test_an_id_token_issued_well_in_the_future_is_refused(self):
+        self.issuer.set(iat_offset=signin.LEEWAY + 120)
+        self.assertEqual(self.sign_in().status_code, 403)
+
+    def test_discovery_naming_another_issuer_is_refused(self):
+        self.issuer.set(discovery_issuer='http://127.0.0.1:1/realms/test')
+        r = self.client.get('/auth/login')
+        self.assertEqual(r.status_code, 502)
+        self.assertIn(b'another issuer', r.data)
+
+    def test_a_cookie_kept_from_before_sign_out_signs_nobody_in(self):
+        self.sign_in()
+        sio = app.socketio.test_client(app.app, flask_test_client=self.client)
+        sio.get_received()
+        self.received()
+        kept = self.client.get_cookie('session').value
+        self.client.get('/auth/logout')
+        self.client.set_cookie('session', kept)
+        self.assertEqual(self.client.get('/api/status').status_code, 401)
+        sio.emit('ptz_command', {'cmd': 'stop'})
+        self.assertFalse(sio.is_connected(), 'the open page is dropped on its next event')
+        self.assertEqual(self.received(), [])
+
+    def test_a_sign_in_left_too_long_is_refused(self):
+        state = self.start()
+        self.clock[0] += signin.LOGIN_TTL + 1
+        r = self.client.get('/auth/callback', query_string={'state': state, 'code': 'code'})
+        self.assertEqual(r.status_code, 400)
+        self.assertEqual(self.client.get('/api/status').status_code, 401)
+
+    def test_a_state_that_is_not_ascii_is_refused_not_a_crash(self):
+        self.start()
+        r = self.client.get('/auth/callback', query_string={'state': '\u00e9t\u00e9', 'code': 'code'})
+        self.assertEqual(r.status_code, 400)
+
+    def test_the_session_cookie_is_secure_over_https(self):
+        app.use(signin.Auth(issuer=self.issuer.url, client_id='visca-ptz',
+                            redirect_url='https://ptz.example.com/auth/callback'))
+        cookie = self.client.get('/auth/login').headers['Set-Cookie']
+        attributes = {a.strip().split('=')[0].lower(): a.strip() for a in cookie.split(';')[1:]}
+        self.assertIn('secure', attributes)
+        self.assertIn('httponly', attributes)
+        self.assertEqual(attributes.get('samesite'), 'SameSite=Lax')
+
+    def test_an_unreachable_issuer_does_not_end_a_session(self):
+        self.sign_in()
+        self.issuer.set(refresh_status=503)
+        self.clock[0] += 600
+        self.assertEqual(self.client.get('/api/status').status_code, 401)
+        self.issuer.set(refresh_status=None)
+        self.assertEqual(self.client.get('/api/status').status_code, 200)
+
+    def test_a_refusal_ends_the_session_for_good(self):
+        self.sign_in()
+        self.issuer.set(refuse_refresh=True)
+        self.clock[0] += 600
+        self.assertEqual(self.client.get('/api/status').status_code, 401)
+        self.issuer.set(refuse_refresh=False)
+        self.assertEqual(self.client.get('/api/status').status_code, 401)
+
+    def test_a_renewal_cannot_switch_the_user(self):
+        self.sign_in()
+        self.issuer.set(sub='u2')
+        self.clock[0] += 600
+        self.assertEqual(self.client.get('/api/status').status_code, 401)
+        self.issuer.set(sub='u1')
+        self.assertEqual(self.client.get('/api/status').status_code, 401)
+
+    def test_an_origin_is_compared_as_an_origin(self):
+        self.sign_in()
+        self.assertEqual(self.command(Origin='HTTP://LocalHost:80').status_code, 200)
+        self.assertEqual(self.command(Origin='http://localhost:8080').status_code, 403)
+        self.assertEqual(signin.origin('https://Ptz.Example.COM:443/auth/callback'), 'https://ptz.example.com')
 
 
 class Configuration(unittest.TestCase):
@@ -199,7 +317,7 @@ class Configuration(unittest.TestCase):
         self.assertIsNone(signin.from_env({}))
 
     def test_an_issuer_needs_a_client_and_a_callback(self):
-        base = {'OIDC_ISSUER': 'https://id.example.com/realms/dmf', 'OIDC_CLIENT_ID': 'c',
+        base = {'OIDC_ISSUER': 'https://id.example.com/realms/test', 'OIDC_CLIENT_ID': 'c',
                 'OIDC_REDIRECT_URL': 'https://ptz.example.com/auth/callback'}
         for missing in ('OIDC_CLIENT_ID', 'OIDC_REDIRECT_URL'):
             env = {k: v for k, v in base.items() if k != missing}
@@ -216,9 +334,8 @@ class Open(unittest.TestCase):
     """Without OIDC_ISSUER nothing asks for a sign-in."""
 
     def setUp(self):
-        previous = app.auth
-        app.auth = None
-        self.addCleanup(setattr, app, 'auth', previous)
+        self.addCleanup(app.use, app.auth)
+        app.use(None)
 
     def test_the_page_is_open_and_offers_no_sign_out(self):
         client = app.app.test_client()

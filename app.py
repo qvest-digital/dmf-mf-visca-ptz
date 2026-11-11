@@ -16,11 +16,19 @@ import auth as signin
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY') or os.urandom(32).hex()
-# None: no sign-in, and the controller is open to whoever reaches it.
-auth = signin.from_env(os.environ)
-if auth is not None:
-    app.config.update(SESSION_COOKIE_SAMESITE='Lax', SESSION_COOKIE_SECURE=auth.secure)
-    print(f"sign-in on: issuer {auth.issuer}, client {auth.client_id}")
+
+def use(sign_in):
+    """Puts sign_in in front of the page, the socket and the API; None
+    leaves the controller open to whoever reaches it."""
+    global auth
+    auth = sign_in
+    secure = auth is not None and auth.secure
+    app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE='Lax', SESSION_COOKIE_SECURE=secure)
+    if auth is not None:
+        print(f"sign-in on: issuer {auth.issuer}, client {auth.client_id}")
+
+
+use(signin.from_env(os.environ))
 # Same origin unless listed: any page a browser has open could otherwise drive
 # the camera through it.
 _origins = [o.strip() for o in os.environ.get('CORS_ALLOWED_ORIGINS', '').split(',') if o.strip()]
